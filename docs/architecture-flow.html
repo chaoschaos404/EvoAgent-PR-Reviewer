@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EvoAgent 架构流程图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f6f8fa;
+    color: #1f2328;
+  }
+  header {
+    background: #24292f;
+    color: #fff;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .sub { font-size: 12px; opacity: 0.7; margin-top: 2px; }
+  header button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  header button:hover { background: #2ea043; }
+  #diagram-wrap {
+    padding: 24px;
+    overflow: auto;
+  }
+  #diagram {
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 24px;
+    min-width: fit-content;
+    display: inline-block;
+  }
+  #error {
+    display: none;
+    margin: 24px;
+    padding: 16px;
+    background: #ffebe9;
+    border: 1px solid #ff818266;
+    border-radius: 8px;
+    color: #cf222e;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EvoAgent PR Reviewer — 端到端架构流程图</h1>
+    <div class="sub">业务服务 → 审查工作流 → 通用执行 → Code Review 能力 → 基础设施 → 评测与自进化</div>
+  </div>
+  <button onclick="downloadSVG()">下载 SVG</button>
+</header>
+<div id="error"></div>
+<div id="diagram-wrap"><div id="diagram"></div></div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+  const graph = `
+  flowchart TB
+      GH["GitHub Pull Request"]
+      DIFF["Unified Diff<br/>标准化代码变更内容"]
+      WH["Webhook<br/>GitHub 主动通知 EvoAgent"]
+      SIGN["HMAC-SHA256<br/>验证通知来源和完整性"]
+      PAT["GitHub PAT<br/>EvoAgent 调用 GitHub API 的凭证"]
+
+      GH --> DIFF
+      GH --> WH
+      WH --> SIGN
+      PAT -.访问 GitHub.-> GH
+
+      subgraph BUSINESS["① 业务服务层"]
+          RS["ReviewService<br/>接收请求、创建任务、选择版本<br/>连接 GitHub、队列和数据库"]
+      end
+
+      SIGN --> RS
+      DIFF --> RS
+
+      subgraph WORKFLOW["② 审查工作流层"]
+          RH["ReviewHarness<br/>定义并控制一次 PR 审查流程"]
+          FSM["有限状态机<br/>PENDING → PLANNING → EXECUTING<br/>→ REVIEWING → SUCCESS"]
+          REPORT["ReviewReport<br/>最终审查报告"]
+
+          RH --> FSM
+          RH --> REPORT
+      end
+
+      RS --> RH
+
+      subgraph EXECUTION["③ 通用执行层"]
+          RT["AgentRuntime<br/>真正执行工作流节点"]
+          CAP["通用运行能力<br/>预算、超时、重试、取消<br/>Checkpoint、断点续跑、Run Trace"]
+          NODE["RuntimeNode<br/>planning / executing / reviewing"]
+
+          RT --> CAP
+          RT --> NODE
+      end
+
+      RH -->|"提交节点和初始状态"| RT
+      RT -->|"返回执行结果"| RH
+
+      subgraph REVIEW["④ Code Review 能力层"]
+          CO["MultiAgentCoordinator<br/>管理 Reviewer 之间的协作"]
+          PLAN["Planner<br/>拆分审查任务"]
+          REV["Reviewer<br/>真正检查代码并输出 Finding"]
+          SEC["SecurityRuleReviewer<br/>安全规则"]
+          REL["ReliabilityRuleReviewer<br/>可靠性规则"]
+          LLM["OpenAICompatibleReviewer<br/>大模型审查"]
+          SKILL["SandboxedSkillReviewer<br/>动态 Skill"]
+          VERIFY["Critic / Evidence / Verifier / Arbiter<br/>质疑、证据复核、门禁、最终裁决"]
+          FIND["Finding<br/>问题类型、文件、行号、证据<br/>严重程度、修复和测试建议"]
+
+          CO --> PLAN
+          PLAN --> REV
+          REV --> SEC
+          REV --> REL
+          REV --> LLM
+          REV --> SKILL
+          REV --> VERIFY
+          VERIFY --> FIND
+      end
+
+      NODE -->|"executing 阶段调用"| CO
+      FIND --> RH
+
+      subgraph INFRA["⑤ 数据与异步基础设施"]
+          DB["SQLite / PostgreSQL<br/>持久保存任务、报告、Trace<br/>Checkpoint、版本和评测数据"]
+          SQLITE["SQLite<br/>单文件，适合本地和测试"]
+          PG["PostgreSQL<br/>适合生产、多进程、多实例"]
+          REDIS["Redis Streams<br/>异步任务传递"]
+          WORKER["Worker<br/>后台领取并执行任务"]
+          QUEUE["XREADGROUP / ACK / Lease<br/>重试 / XAUTOCLAIM / DLQ"]
+
+          DB --> SQLITE
+          DB --> PG
+          REDIS --> WORKER
+          REDIS --> QUEUE
+      end
+
+      RS <-->|"保存和读取业务数据"| DB
+      RS -->|"提交异步任务"| REDIS
+      WORKER --> RH
+
+      subgraph EVOLUTION["⑥ 评测与自进化"]
+          FEEDBACK["审查反馈<br/>误报、漏报、错误修复"]
+          EVOLVE["生成 Prompt / Skill 候选版本<br/>不修改模型权重和 Harness"]
+          VAL["Validation<br/>用于优化和选择候选版本"]
+          HOLD["Holdout ≈ Test Set<br/>不参与调优，检查泛化和退化"]
+          METRIC["Precision：报得准不准<br/>Recall：找得全不全<br/>F1：准确与完整的综合指标"]
+          GATE["版本门禁<br/>通过后影子流量、灰度发布<br/>不通过则保留旧版本"]
+
+          FEEDBACK --> EVOLVE
+          EVOLVE --> VAL
+          VAL --> HOLD
+          HOLD --> METRIC
+          METRIC --> GATE
+          GATE -.通过后增强.-> REV
+      end
+
+      REPORT --> FEEDBACK
+  `;
+
+  const errBox = document.getElementById('error');
+
+  try {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'default',
+      flowchart: { htmlLabels: true, curve: 'basis' },
+      securityLevel: 'loose'
+    });
+    const { svg } = await mermaid.render('evoagent-arch', graph);
+    document.getElementById('diagram').innerHTML = svg;
+  } catch (e) {
+    errBox.style.display = 'block';
+    errBox.textContent = 'Mermaid 渲染失败：' + (e.message || e);
+  }
+
+  window.downloadSVG = function () {
+    const svg = document.querySelector('#diagram svg');
+    if (!svg) return alert('图尚未渲染完成');
+    const blob = new Blob([svg.outerHTML], { type: 'image/svg+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'evoagent-architecture.svg';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+</script>
+</body>
+</html>

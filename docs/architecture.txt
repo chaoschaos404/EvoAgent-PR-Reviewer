@@ -1,0 +1,43 @@
+EvoAgent 架构（文字版）
+
+GitHub PR（Diff 下载 + Webhook 通知 + HMAC 签名校验）
+  ↓
+① 业务服务层
+  ReviewService：接收请求、创建任务、选择版本，连接 GitHub / 队列 / 数据库
+  ↓
+② 审查工作流层
+  ReviewHarness：一次 PR 审查的总控
+  状态机：PENDING → PLANNING → EXECUTING → REVIEWING → SUCCESS
+  输出：ReviewReport
+  ↓
+③ 通用执行层
+  AgentRuntime：真正执行工作流节点
+  能力：预算 / 超时 / 重试 / 取消 / Checkpoint / 断点续跑 / Trace
+  节点：planning / executing / reviewing
+  ↓（executing 阶段调用）
+④ Code Review 能力层
+  MultiAgentCoordinator
+  ├─ Planner：拆分审查任务
+  ├─ Reviewer（并行检查代码）
+  │   ├─ SecurityRuleReviewer：安全规则
+  │   ├─ ReliabilityRuleReviewer：可靠性规则
+  │   ├─ OpenAICompatibleReviewer：大模型审查
+  │   └─ SandboxedSkillReviewer：动态 Skill
+  ├─ 校验链：Critic → Evidence → Verifier → Arbiter（质疑 → 证据复核 → 门禁 → 最终裁决）
+  └─ 输出：Finding（问题类型 / 文件 / 行号 / 证据 / 严重程度 / 修复建议）
+  ↓
+⑤ 数据与异步基础设施（贯穿全程）
+  ├─ SQLite / PostgreSQL：任务、报告、Trace、Checkpoint、版本
+  ├─ Redis Streams：异步队列（ACK / 租约 / 重试 / 死信队列）
+  └─ Worker：后台领取并执行任务
+  ↓
+⑥ 评测与自进化（闭环）
+  报告 → 用户反馈（误报 / 漏报 / 错误修复）
+  → 生成 Prompt / Skill 候选版本（不改模型权重）
+  → Validation 集回放 → Holdout 集回放
+  → 指标：Precision / Recall / F1
+  → 版本门禁：通过则灰度发布并增强 Reviewer，不通过则保留旧版本
+
+一句话主线：
+GitHub 送来 Diff → Service 建任务 → Harness 控流程 → Runtime 跑节点
+→ 多 Agent 审查出 Finding → 结果入库出报告 → 反馈驱动进化，进化后再增强审查。

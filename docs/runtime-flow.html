@@ -1,0 +1,183 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EvoAgent 运行时关系与流程图</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif;
+    background: #f6f8fa;
+    color: #1f2328;
+  }
+  header {
+    background: #24292f;
+    color: #fff;
+    padding: 16px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    position: sticky;
+    top: 0;
+    z-index: 10;
+  }
+  header h1 { font-size: 16px; font-weight: 600; }
+  header .sub { font-size: 12px; opacity: 0.7; margin-top: 2px; }
+  header button {
+    background: #238636;
+    color: #fff;
+    border: none;
+    border-radius: 6px;
+    padding: 8px 14px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  header button:hover { background: #2ea043; }
+  #diagram-wrap { padding: 24px; overflow: auto; }
+  #diagram {
+    background: #fff;
+    border: 1px solid #d0d7de;
+    border-radius: 8px;
+    padding: 24px;
+    min-width: fit-content;
+    display: inline-block;
+  }
+  #error {
+    display: none;
+    margin: 24px;
+    padding: 16px;
+    background: #ffebe9;
+    border: 1px solid #ff818266;
+    border-radius: 8px;
+    color: #cf222e;
+    font-size: 14px;
+    white-space: pre-wrap;
+  }
+  @page { size: 2400px 4700px; margin: 0; }
+  @media print {
+    header { position: static; }
+    #diagram-wrap { padding: 12px; }
+  }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>EvoAgent 运行时关系与流程（非线性版）</h1>
+    <div class="sub">实线 = 主流程；虚线 = 循环 / 回边 / 旁路（重试、返工、恢复、shadow、记忆、进化闭环）</div>
+  </div>
+  <button onclick="downloadSVG()">下载 SVG</button>
+</header>
+<div id="error"></div>
+<div id="diagram-wrap"><div id="diagram"></div></div>
+
+<script type="module">
+  import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
+
+  const graph = `
+  flowchart TB
+      subgraph ENTRY["入口"]
+          API["API /v1/reviews<br/>Bearer + RBAC"]
+          WH["GitHub Webhook<br/>HMAC 签名 + Delivery 去重"]
+      end
+
+      subgraph SVC["ReviewService 总协调"]
+          AUTH["鉴权 / 租户 / 仓库授权 / 大小校验"]
+          TASK["创建任务 + 保存 diff payload"]
+          LANE["ReleaseManager 分配 lane<br/>stable / canary / shadow"]
+          BUILD["组装 reviewer 集合 → 包成协调器<br/>内置 + 进化技能 + 候选或稳定 LLM"]
+      end
+
+      API --> AUTH
+      WH --> AUTH
+      AUTH --> TASK --> LANE --> BUILD
+
+      BUILD --> MODE{"同步 or 异步?"}
+      MODE -- 同步 --> PLAN
+      MODE -- 异步 --> QUEUE["TaskQueue<br/>内存队列 / Redis Streams"]
+      QUEUE --> WORKER["worker 领取 + 补拉 diff"] --> PLAN
+      QUEUE -. "失败重试 / 租约回收 / DLQ" .-> QUEUE
+
+      subgraph HARNESS["ReviewHarness 外层工作流 · Runtime① · checkpoint=True"]
+          PLAN["planning<br/>解析 diff → parsed"]
+          EXEC["executing<br/>调用协调器"]
+          REP["reviewing<br/>算风险 + 组装 ReviewReport"]
+          PLAN --> EXEC --> REP
+      end
+
+      CK[("checkpoints 表<br/>按节点存输出")]
+      PLAN -- 完成即存 --> CK
+      EXEC -- 完成即存 --> CK
+      REP -- 完成即存 --> CK
+      CK -. "resume：灌回已完成输出并跳过" .-> PLAN
+
+      REP --> DONE["SUCCESS：报告 + trace 落库"]
+
+      subgraph COORD["MultiAgentCoordinator 内层工作流 · Runtime② · checkpoint=False"]
+          P["planner<br/>确定性分派（分派单）"]
+          SP["specialists<br/>审查器集合并行（线程池）"]
+          DEL["deliberation<br/>Critic 质疑 + Reflection 指导"]
+          EV["evidence<br/>独立签名复验"]
+          VE["verifier<br/>Finding Gate：置信度 ≥0.55 等"]
+          AR["arbiter<br/>批准 / 去重 / 排序"]
+          P --> SP --> DEL --> EV --> VE --> AR
+          SP -. "失败：重试 → 替补 handoff" .-> SP
+          DEL -. "返工 ≤2 轮：指导发回原审查器" .-> SP
+          VE -. "拒绝原因留痕" .-> AR
+      end
+
+      EXEC -- "调用 review_with_context" --> P
+      AR -- "verified findings 返回" --> EXEC
+
+      DONE --> SHADOW{"命中 shadow 桶?"}
+      SHADOW -- 是 --> SH["候选审查器旁路运行<br/>只记差异，不影响主报告"] --> OUT
+      SHADOW -- 否 --> OUT
+      OUT["输出阶段<br/>返回 201 / upsert GitHub 评论"]
+
+      subgraph LOOP["记忆与进化闭环"]
+          MEM[("分层记忆<br/>working/episodic/semantic/procedural")]
+          FB["反馈失败案例<br/>missed_issue / false_positive"]
+          EE["EvolutionEngine<br/>新 prompt 版本 + 评测门禁"]
+          SE["SkillEvolutionEngine<br/>新规则 artifact + 回放门禁"]
+      end
+
+      AR -- "remember_finding / consolidate_task" --> MEM
+      MEM -. "recall_memory（LLM 工具循环）" .-> SP
+      OUT -. "用户反馈" .-> FB
+      REP -. "execution_error 失败案例" .-> FB
+      FB --> EE
+      FB --> SE
+      EE -. "激活 / canary 替换 LLM prompt" .-> BUILD
+      SE -. "按租户激活 → 新声明式审查器" .-> BUILD
+  `;
+
+  const errBox = document.getElementById('error');
+
+  try {
+    mermaid.initialize({
+      startOnLoad: false,
+      theme: 'default',
+      flowchart: { htmlLabels: true, curve: 'basis', useMaxWidth: false },
+      securityLevel: 'loose'
+    });
+    const { svg } = await mermaid.render('evoagent-runtime', graph);
+    document.getElementById('diagram').innerHTML = svg;
+  } catch (e) {
+    errBox.style.display = 'block';
+    errBox.textContent = 'Mermaid 渲染失败：' + (e.message || e);
+  }
+
+  window.downloadSVG = function () {
+    const svg = document.querySelector('#diagram svg');
+    if (!svg) return alert('图尚未渲染完成');
+    const blob = new Blob([svg.outerHTML], { type: 'image/svg+xml' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'evoagent-runtime-flow.svg';
+    a.click();
+    URL.revokeObjectURL(a.href);
+  };
+</script>
+</body>
+</html>
